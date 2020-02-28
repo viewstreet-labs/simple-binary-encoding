@@ -22,12 +22,16 @@ import uk.co.real_logic.sbe.generation.CodeGenerator;
 import uk.co.real_logic.sbe.generation.Generators;
 import uk.co.real_logic.sbe.ir.*;
 
+import javax.lang.model.SourceVersion;
 import java.io.IOException;
 import java.io.Writer;
 import java.util.ArrayList;
 import java.util.Formatter;
 import java.util.List;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import static uk.co.real_logic.sbe.SbeTool.JAVA_INTERFACE_PACKAGE;
 import static uk.co.real_logic.sbe.generation.java.JavaGenerator.CodecType.DECODER;
@@ -53,6 +57,10 @@ public class JavaGenerator implements CodeGenerator
     private static final String COMPOSITE_ENCODER_FLYWEIGHT = "CompositeEncoderFlyweight";
     private static final String MESSAGE_DECODER_FLYWEIGHT = "MessageDecoderFlyweight";
     private static final String MESSAGE_ENCODER_FLYWEIGHT = "MessageEncoderFlyweight";
+
+    private static final Pattern ALT_NAME_REGEX =
+        Pattern.compile("^.*altName='(?<altName>.*)';$", Pattern.DOTALL | Pattern.MULTILINE);
+
 
     private final Ir ir;
     private final OutputManager outputManager;
@@ -1232,8 +1240,8 @@ public class JavaGenerator implements CodeGenerator
             out.append(generateEnumFileHeader(ir.applicableNamespace()));
             out.append(generateEnumDeclaration(enumName, enumToken));
 
-            out.append(generateEnumValues(getMessageBody(tokens)));
-            out.append(generateEnumBody(enumToken, enumName));
+            final boolean shouldGenerateEnumStringConstructor = generateEnumValues(out, getMessageBody(tokens));
+            out.append(generateEnumBody(shouldGenerateEnumStringConstructor, enumToken, enumName));
 
             out.append(generateEnumLookupMethod(getMessageBody(tokens), enumName));
 
@@ -1442,16 +1450,27 @@ public class JavaGenerator implements CodeGenerator
         }
     }
 
-    private CharSequence generateEnumValues(final List<Token> tokens)
+    private boolean generateEnumValues(final Writer out, final List<Token> tokens) throws IOException
     {
         final StringBuilder sb = new StringBuilder();
+        boolean genEnumConstructor = false;
 
         for (final Token token : tokens)
         {
             final Encoding encoding = token.encoding();
             final CharSequence constVal = generateLiteral(encoding.primitiveType(), encoding.constValue().toString());
             generateTypeJavadoc(sb, INDENT, token);
-            sb.append(INDENT).append(token.name()).append('(').append(constVal).append("),\n\n");
+            final String altName = getAltName(token);
+            if (altName != null)
+            {
+                sb.append(INDENT).append(token.name()).append('(').append(constVal)
+                .append(", \"").append(altName).append("\"),\n\n");
+                genEnumConstructor = true;
+            }
+            else
+            {
+                sb.append(INDENT).append(token.name()).append('(').append(constVal).append("),\n\n");
+            }
         }
 
         final Token token = tokens.get(0);
@@ -1472,23 +1491,94 @@ public class JavaGenerator implements CodeGenerator
         sb.append(INDENT).append(" */\n");
         sb.append(INDENT).append("NULL_VAL").append('(').append(nullVal).append(");\n\n");
 
-        return sb;
+        out.append(sb);
+        return genEnumConstructor;
     }
 
-    private CharSequence generateEnumBody(final Token token, final String enumName)
+    private String getAltName(final Token token)
+    {
+        String altName = null;
+        final String description = token.description();
+        if (description != null)
+        {
+            try
+            {
+                final Matcher regexMatcher = ALT_NAME_REGEX.matcher(description);
+                if (regexMatcher.find())
+                {
+                    altName = regexMatcher.group("altName");
+                }
+            }
+            catch (final PatternSyntaxException ex)
+            {
+                // Syntax error in the regular expression
+            }
+        }
+        return altName;
+    }
+
+    private boolean isValidIdentifier(final String className)
+    {
+        return SourceVersion.isIdentifier(className) && !SourceVersion.isKeyword(className);
+    }
+
+    private String cleanIdentifier(final String identifier)
+    {
+        if (identifier == null || identifier.length() < 1)
+        {
+            return identifier;
+        }
+        final StringBuilder cleanIdentifier = new StringBuilder();
+        if (!Character.isJavaIdentifierStart(identifier.charAt(0)) || SourceVersion.isKeyword(identifier))
+        {
+            cleanIdentifier.append('_');
+        }
+
+        for (int i = 0; i < identifier.length(); i++)
+        {
+            if (!Character.isJavaIdentifierPart(identifier.charAt(i)))
+            {
+                cleanIdentifier.append('_');
+            }
+            else
+            {
+                cleanIdentifier.append(identifier.charAt(i));
+            }
+        }
+        return cleanIdentifier.toString();
+    }
+
+    private CharSequence generateEnumBody(final boolean genEnumConstructor, final Token token, final String enumName)
     {
         final String javaEncodingType = primitiveTypeName(token);
 
-        return
+        String body =
             "    private final " + javaEncodingType + " value;\n\n" +
             "    " + enumName + "(final " + javaEncodingType + " value)\n" +
             "    {\n" +
             "        this.value = value;\n" +
-            "    }\n\n" +
-            "    public " + javaEncodingType + " value()\n" +
+            "    }\n\n";
+        if (genEnumConstructor)
+        {
+            body += "    " + enumName + "(final " + javaEncodingType + " value, String name)\n" +
+                "    {\n" +
+                "        this.value = value;\n" +
+                "        try {\n" +
+                "            java.lang.reflect.Field fieldName = " +
+                                 "getClass().getSuperclass().getDeclaredField(\"name\");\n" +
+                "            fieldName.setAccessible(true);\n" +
+                "            fieldName.set(this, name);\n" +
+                "            fieldName.setAccessible(false);\n" +
+                "        } catch (NoSuchFieldException | IllegalAccessException e) {\n" +
+                "            throw new RuntimeException(\"Unable to create enum: \" + name, e);\n" +
+                "        }\n" +
+                "    }\n\n";
+        }
+        body += "    public " + javaEncodingType + " value()\n" +
             "    {\n" +
             "        return value;\n" +
-            "    }\n";
+            "    }\n\n";
+        return body;
     }
 
     private CharSequence generateEnumLookupMethod(final List<Token> tokens, final String enumName)
